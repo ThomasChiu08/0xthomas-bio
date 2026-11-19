@@ -41,7 +41,7 @@ function paintPaper() {
     ctx.restore();
   }
 }
-function refresh() { paintPaper(); LiquidGlass.refreshAll(); }
+function refresh() { paintPaper(); LiquidGlass.refreshAll(); updateTabInk(); }
 function resize() { paintPaper(); positionSelection(); refresh(); }
 function positionSelection() {
   const active = tabs.find(tab => tab.hasAttribute('aria-current')) || tabs[0];
@@ -62,6 +62,7 @@ function setView(view) {
     screen.toggleAttribute('inert', !on);
     screen.setAttribute('aria-hidden', on ? 'false' : 'true');
   }
+  watchTabInk();
 }
 function navigate(name, focus = true) {
   name = aliases[name] || name;
@@ -126,6 +127,82 @@ function paintStudioPhotos(context, region) {
     context.restore();
   }
 }
+
+
+const contrast = document.createElement('canvas');
+const contrastCtx = contrast.getContext('2d', { willReadFrequently: true });
+const reducedTransparency = matchMedia('(prefers-reduced-transparency: reduce)');
+const tabInk = new WeakMap();
+let tabInkFrame;
+
+function updateTabInk() {
+  if (reducedTransparency.matches) {
+    for (const tab of tabs) {
+      tab.removeAttribute('data-ink');
+      tabInk.delete(tab);
+    }
+    return;
+  }
+  const dockBox = dock.getBoundingClientRect();
+  const width = Math.max(1, Math.round(dockBox.width));
+  const height = Math.max(1, Math.round(dockBox.height));
+  if (contrast.width !== width || contrast.height !== height) {
+    contrast.width = width;
+    contrast.height = height;
+  }
+  contrastCtx.setTransform(1, 0, 0, 1, 0, 0);
+  contrastCtx.fillStyle = '#f8f7f3';
+  contrastCtx.fillRect(0, 0, width, height);
+  if (paper.width && paper.height) {
+    const dpr = paper.width / innerWidth;
+    contrastCtx.drawImage(
+      paper,
+      dockBox.x * dpr, dockBox.y * dpr, dockBox.width * dpr, dockBox.height * dpr,
+      0, 0, width, height
+    );
+  }
+  contrastCtx.setTransform(1, 0, 0, 1, -dockBox.x, -dockBox.y);
+  paintStudioPhotos(contrastCtx, dockBox);
+  contrastCtx.setTransform(1, 0, 0, 1, 0, 0);
+  let pixels;
+  try { pixels = contrastCtx.getImageData(0, 0, width, height).data; }
+  catch { return; }
+  for (const tab of tabs) {
+    const box = tab.getBoundingClientRect();
+    const x0 = Math.max(0, Math.floor(box.x - dockBox.x));
+    const y0 = Math.max(0, Math.floor(box.y - dockBox.y));
+    const x1 = Math.min(width, Math.ceil(box.x + box.width - dockBox.x));
+    const y1 = Math.min(height, Math.ceil(box.y + box.height - dockBox.y));
+    let luma = 0, count = 0;
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const i = (y * width + x) * 4;
+        luma += 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
+        count++;
+      }
+    }
+    const average = count ? luma / (count * 255) : 0.97;
+    const previous = tabInk.get(tab);
+    const ink = previous === 'light'
+      ? (average > 0.62 ? 'dark' : 'light')
+      : (average < 0.48 ? 'light' : 'dark');
+    tabInk.set(tab, ink);
+    if (ink === 'light') tab.dataset.ink = 'light';
+    else tab.removeAttribute('data-ink');
+  }
+}
+
+function watchTabInk() {
+  cancelAnimationFrame(tabInkFrame);
+  function tick() {
+    updateTabInk();
+    if (document.body.dataset.view === 'studio' && !reducedTransparency.matches) {
+      tabInkFrame = requestAnimationFrame(tick);
+    }
+  }
+  tick();
+}
+reducedTransparency.addEventListener('change', watchTabInk);
 
 const material = {
   // DOM LiquidGlass uses the V2 optical material, not the V1 string presets.
@@ -539,3 +616,4 @@ function setupStudio() {
   syncRails(false);
 }
 setupStudio();
+watchTabInk();

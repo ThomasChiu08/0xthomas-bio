@@ -264,8 +264,10 @@ details[open] .detail{animation:reveal .24s ease-out}
   font-size:12px;
   line-height:1.2;
   letter-spacing:-.1px;
-  transition:transform .16s,background .2s;
+  color:var(--ink);
+  transition:transform .16s,background .2s,color .2s;
 }
+.tab[data-ink="light"]{color:#fff}
 .tab svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 .tab:hover{background:#ffffff55}
 .tab:active{transform:scale(.94)}
