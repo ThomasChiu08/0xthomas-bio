@@ -63,6 +63,7 @@ function setView(view) {
     screen.setAttribute('aria-hidden', on ? 'false' : 'true');
   }
   watchTabInk();
+  document.dispatchEvent(new Event('viewchange'));
 }
 function navigate(name, focus = true) {
   name = aliases[name] || name;
@@ -97,10 +98,42 @@ document.querySelectorAll('details').forEach(detail => detail.addEventListener('
 
 // Auto capture deliberately skips BUTTON subtrees. Keep native plate controls
 // intact and add their photos through the official viewport-space painter API.
+function paintMedia(context, region, img) {
+  if (!img || img.hidden || !img.complete || !img.naturalWidth) return;
+  const box = img.getBoundingClientRect();
+  if (!box.width || !box.height || box.right <= region.x || box.left >= region.x + region.width
+    || box.bottom <= region.y || box.top >= region.y + region.height) return;
+  context.save();
+  let opacity = 1;
+  for (let node = img; node; node = node.parentElement) {
+    const style = getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden') { opacity = 0; break; }
+    opacity *= Number(style.opacity);
+    if (node === img || /(hidden|clip|auto|scroll)/.test(`${style.overflowX} ${style.overflowY}`)) {
+      const clip = node.getBoundingClientRect();
+      context.beginPath();
+      context.rect(clip.x, clip.y, clip.width, clip.height);
+      context.clip();
+    }
+  }
+  context.globalAlpha *= opacity;
+  context.filter = getComputedStyle(img).filter;
+  const scale = Math.max(box.width / img.naturalWidth, box.height / img.naturalHeight);
+  const width = img.naturalWidth * scale, height = img.naturalHeight * scale;
+  context.drawImage(img, box.x + (box.width - width) / 2, box.y + (box.height - height) / 2, width, height);
+  context.restore();
+}
+
 function paintStudioPhotos(context, region) {
-  if (document.body.dataset.view !== 'studio' || document.body.classList.contains('viewer-open')) return;
-  // Query each frame: All creates/removes loop clones when filters/width change.
-  for (const img of document.querySelectorAll('.studio-board .plate img')) {
+  if (document.body.classList.contains('viewer-open')) {
+    paintMedia(context, region, document.querySelector('.viewer-image'));
+    return;
+  }
+  if (document.body.dataset.view !== 'studio') return;
+  // Paint back to front: the centered sleeve must win where covers overlap.
+  const images = [...document.querySelectorAll('.studio-board .plate img')]
+    .sort((a, b) => (Number(a.parentElement.style.zIndex) || 0) - (Number(b.parentElement.style.zIndex) || 0));
+  for (const img of images) {
     if (!img.complete || !img.naturalWidth) continue;
     const box = img.getBoundingClientRect();
     if (!box.width || !box.height || box.right <= region.x || box.left >= region.x + region.width
@@ -119,7 +152,7 @@ function paintStudioPhotos(context, region) {
       }
     }
     context.globalAlpha *= opacity;
-    // Match the existing centered object-fit: cover and All-rail focus blur.
+    // Keep sampling the transformed viewport bounds, including under the dock.
     context.filter = getComputedStyle(img).filter;
     const scale = Math.max(box.width / img.naturalWidth, box.height / img.naturalHeight);
     const width = img.naturalWidth * scale, height = img.naturalHeight * scale;
@@ -196,7 +229,8 @@ function watchTabInk() {
   cancelAnimationFrame(tabInkFrame);
   function tick() {
     updateTabInk();
-    if (document.body.dataset.view === 'studio' && !reducedTransparency.matches) {
+    const liveInk = document.body.dataset.view === 'studio' || document.body.classList.contains('viewer-open');
+    if (liveInk && !reducedTransparency.matches) {
       tabInkFrame = requestAnimationFrame(tick);
     }
   }
@@ -239,9 +273,6 @@ addEventListener('hashchange', () => navigate(location.hash.slice(1)));
 const initial = aliases[location.hash.slice(1)] || location.hash.slice(1);
 if (views.includes(initial)) navigate(initial, false);
 
-await Promise.all(lenses.map(lens => lens.ready));
-document.documentElement.dataset.glassReady = 'true';
-
 function setupStudio() {
   const board = document.querySelector('.studio-board');
   const rows = [...document.querySelectorAll('.studio-row')];
@@ -252,13 +283,143 @@ function setupStudio() {
   const kindEl = document.querySelector('.viewer-kind');
   const copyEl = document.querySelector('.viewer-copy');
   const imageEl = document.querySelector('.viewer-image');
-  const visible = () => plates.filter(plate => !plate.dataset.clone && !plate.closest('.studio-row').hidden);
-  const motionOk = () => !reduced.matches;
+  const visible = () => plates.filter(plate => !plate.closest('.studio-row').hidden);
   const gsap = window.gsap;
   let index = 0;
-  let snapping = false;
-  let wrapping = false;
-  const settleTimers = new Map();
+
+  const audioRoot = document.querySelector('.viewer-audio');
+  const audioToggle = document.querySelector('.viewer-audio-toggle');
+  const volumeSlider = document.querySelector('.viewer-volume-slider');
+  const progressSlider = document.querySelector('.viewer-progress-slider');
+  const timeNow = document.querySelector('.viewer-time-now');
+  const timeEnd = document.querySelector('.viewer-time-end');
+  const player = document.querySelector('.viewer-player');
+  const volumeKey = 'studio-audio-volume';
+  let audioSrc = '';
+  let scrubbing = false;
+
+  function formatTime(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+    const total = Math.floor(seconds);
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+  }
+  function readVolume() {
+    const raw = localStorage.getItem(volumeKey);
+    if (raw == null || raw === '') return 0.7;
+    const stored = Number(raw);
+    if (Number.isFinite(stored) && stored >= 0 && stored <= 1) return stored;
+    return 0.7;
+  }
+  function applyVolume(value) {
+    const next = Math.min(1, Math.max(0, Number(value)));
+    if (!Number.isFinite(next)) return;
+    if (player) player.volume = next;
+    if (volumeSlider && Number(volumeSlider.value) !== next) volumeSlider.value = String(next);
+    try { localStorage.setItem(volumeKey, String(next)); } catch {}
+  }
+  function resetProgress() {
+    if (progressSlider) {
+      progressSlider.value = '0';
+      progressSlider.max = '0';
+    }
+    if (timeNow) timeNow.textContent = '0:00';
+    if (timeEnd) timeEnd.textContent = '0:00';
+  }
+  function updateProgress() {
+    if (!player || !progressSlider) return;
+    const duration = player.duration;
+    const current = player.currentTime || 0;
+    if (Number.isFinite(duration) && duration > 0) {
+      progressSlider.max = String(duration);
+      if (!scrubbing) progressSlider.value = String(current);
+      if (timeEnd) timeEnd.textContent = formatTime(duration);
+    }
+    if (timeNow) timeNow.textContent = formatTime(scrubbing ? Number(progressSlider.value) : current);
+  }
+  function seekTo(value) {
+    const next = Number(value);
+    if (!player || !Number.isFinite(next)) return;
+    player.currentTime = Math.min(Number(progressSlider.max) || next, Math.max(0, next));
+    if (timeNow) timeNow.textContent = formatTime(player.currentTime);
+  }
+  function setAudioToggle(playing) {
+    if (!audioToggle) return;
+    audioToggle.textContent = playing ? 'Pause' : 'Play';
+    audioToggle.setAttribute('aria-label', playing ? 'Pause music' : 'Play music');
+  }
+  function toggleAudio() {
+    if (!player || !audioSrc) return;
+    if (player.paused) player.play().catch(() => setAudioToggle(false));
+    else player.pause();
+  }
+  function stopAudio() {
+    if (!player) return;
+    player.pause();
+    player.removeAttribute('src');
+    player.load();
+    audioSrc = '';
+    scrubbing = false;
+    if (audioRoot) audioRoot.hidden = true;
+    setAudioToggle(false);
+    resetProgress();
+  }
+  function syncAudio(plate) {
+    if (!player || !audioRoot) return;
+    const next = plate?.dataset.audio || '';
+    if (!next) {
+      stopAudio();
+      return;
+    }
+    audioRoot.hidden = false;
+    applyVolume(readVolume());
+    if (audioSrc === next) {
+      if (player.paused) player.play().catch(() => setAudioToggle(false));
+      updateProgress();
+      return;
+    }
+    audioSrc = next;
+    player.src = next;
+    player.currentTime = 0;
+    resetProgress();
+    player.play().catch(() => setAudioToggle(false));
+  }
+  if (player) {
+    applyVolume(readVolume());
+    player.addEventListener('play', () => setAudioToggle(true));
+    player.addEventListener('pause', () => setAudioToggle(false));
+    player.addEventListener('ended', () => { setAudioToggle(false); updateProgress(); });
+    player.addEventListener('timeupdate', updateProgress);
+    player.addEventListener('loadedmetadata', updateProgress);
+    player.addEventListener('durationchange', updateProgress);
+  }
+  if (audioToggle) {
+    audioToggle.addEventListener('click', event => {
+      event.stopPropagation();
+      toggleAudio();
+    });
+  }
+  if (volumeSlider) {
+    volumeSlider.addEventListener('input', () => applyVolume(volumeSlider.value));
+    volumeSlider.addEventListener('pointerdown', event => event.stopPropagation());
+  }
+  if (progressSlider) {
+    const endScrub = () => {
+      if (!scrubbing) return;
+      scrubbing = false;
+      seekTo(progressSlider.value);
+    };
+    progressSlider.addEventListener('pointerdown', event => {
+      event.stopPropagation();
+      scrubbing = true;
+    });
+    progressSlider.addEventListener('input', () => {
+      scrubbing = true;
+      seekTo(progressSlider.value);
+    });
+    addEventListener('pointerup', endScrub);
+    addEventListener('pointercancel', endScrub);
+  }
+
 
   function showPlate(plate) {
     kindEl.textContent = plate.dataset.label || '';
@@ -279,253 +440,605 @@ function setupStudio() {
     }
   }
 
-  function activeTracks() {
-    if (board.dataset.filter !== 'all') return [];
-    return tracks.filter(track => !track.closest('.studio-row').hidden);
-  }
+  // One controller per row. No native horizontal scrolling, clones, or shared
+  // gesture flags: GSAP only interpolates this deck's numeric index.
+  function createDeck(track) {
+    const items = [...track.querySelectorAll('.plate')];
+    const row = track.closest('.studio-row');
+    const loop = row.dataset.row === 'still';
+    const count = items.length;
+    const state = { index: 0 };
+    let target = 0;
+    let tween = null;
+    let gesture = null;
+    let wheelTimer = null;
+    let suppressClickUntil = 0;
+    const modulo = value => ((value % count) + count) % count;
+    const limit = value => loop ? value : Math.max(0, Math.min(count - 1, value));
+    const offsetOf = i => loop
+      ? modulo(i - state.index + count / 2) - count / 2
+      : i - state.index;
+    const activeIndex = () => modulo(Math.round(state.index));
+    let sleeping = false;
+    const enabled = () => !sleeping && !row.hidden && viewer.hidden && document.body.dataset.view === 'studio';
+    const focused = () => track === document.activeElement || track.contains(document.activeElement);
+    const unit = () => Math.max(90, items[0].offsetWidth * .55);
+    let hoverIndex = -1;
+    const finePointer = window.matchMedia('(hover: hover) and (pointer: fine)');
+    const modeFrom = pointerType => {
+      if (pointerType === 'touch') return 'touch';
+      if (pointerType === 'mouse' || pointerType === 'pen') return 'mouse';
+      return finePointer.matches ? 'mouse' : 'touch';
+    };
+    const setInputMode = mode => { track.dataset.input = mode; };
+    setInputMode(modeFrom());
+    finePointer.addEventListener('change', () => { if (!gesture) setInputMode(modeFrom()); });
 
-  function originalsOf(track) {
-    return [...track.querySelectorAll('.plate')].filter(plate => !plate.dataset.clone);
-  }
+    track.classList.add('coverflow');
+    track.tabIndex = -1;
+    track.setAttribute('role', 'group');
+    track.setAttribute('aria-roledescription', 'carousel');
+    track.setAttribute('aria-label', row.getAttribute('aria-label'));
+    track.setAttribute('aria-description', 'Use Left and Right arrows or drag to change covers. Scroll horizontally, or use the mouse wheel while focused. Activate the center cover to open it.');
+    const position = document.createElement('p');
+    position.className = 'deck-position sr-only';
+    position.id = `position-${row.dataset.row}`;
+    position.setAttribute('aria-live', 'polite');
+    position.setAttribute('aria-atomic', 'true');
+    row.append(position);
+    for (const item of items) {
+      item.setAttribute('aria-describedby', position.id);
+      const img = item.querySelector('img');
+      if (img) img.draggable = false;
+    }
 
-  function setSpan(track) {
-    const a = track.querySelector('.plate[data-copy="0"]');
-    const b = track.querySelector('.plate[data-copy="1"]');
-    if (a && b) return b.offsetLeft - a.offsetLeft;
-    return Number(track.dataset.span) || 0;
-  }
+    function render() {
+      const active = activeIndex();
+      items.forEach((item, i) => {
+        const offset = offsetOf(i);
+        const distance = Math.abs(offset);
+        // Interpolate the reference's signed side around zero, so crossing the
+        // center is continuous. At distance >= 1 the sleeve is fully tilted.
+        const side = Math.max(-1, Math.min(1, offset));
+        const spread = Math.sign(offset) * Math.max(0, distance - 1);
+        // Distance keeps growing past the first neighbor so edge covers sit
+        // farther back and read as the smallest plates in the perspective.
+        const retreat = distance;
+        const edge = Math.max(0, Math.min(1, (2.45 - distance) / .55));
+        const dim = 1 - Math.min(.22, distance * .14);
+        let opacity = edge * dim;
+        const hover = i === hoverIndex && i !== active && opacity > 0;
+        if (hover) opacity = Math.min(1, opacity + .1);
+        const scale = reduced.matches ? 1 : 1 - Math.min(.3, distance * .15) + (hover ? .03 : 0);
+        item.style.setProperty('--side', String(side));
+        item.style.setProperty('--spread', String(spread));
+        item.style.setProperty('--retreat', String(retreat));
+        item.style.setProperty('--scale', String(scale));
+        item.style.opacity = String(opacity);
+        item.style.visibility = opacity === 0 ? 'hidden' : 'visible';
+        item.style.zIndex = String(100 - Math.round(distance * 10) + (hover ? 2 : 0));
+        item.tabIndex = i === active ? 0 : -1;
+        item.classList.toggle('is-focus', i === active);
+        if (i === active) item.setAttribute('aria-current', 'true');
+        else item.removeAttribute('aria-current');
+      });
+    }
 
-  function destroyLoop(track) {
-    track.querySelectorAll('.plate[data-clone]').forEach(node => node.remove());
-    delete track.dataset.copies;
-    delete track.dataset.span;
-    delete track.dataset.viewport;
-    delete track.dataset.looped;
-  }
+    function stopTween() {
+      tween?.kill();
+      tween = null;
+      clearTimeout(wheelTimer);
+      wheelTimer = null;
+    }
 
-  function bindClone(clone, origin) {
-    clone.addEventListener('pointermove', event => {
-      const box = clone.getBoundingClientRect();
-      clone.style.setProperty('--mx', `${((event.clientX - box.left) / box.width) * 100}%`);
-      clone.style.setProperty('--my', `${((event.clientY - box.top) / box.height) * 100}%`);
+    function finish(focus) {
+      // Rebase only after settlement. Modulo leaves all visual offsets intact.
+      state.index = loop ? modulo(Math.round(state.index)) : limit(Math.round(state.index));
+      target = state.index;
+      tween = null;
+      render();
+      position.textContent = `${String(activeIndex() + 1).padStart(2, '0')} / ${String(count).padStart(2, '0')}`;
+      if (focus && enabled() && focused()) items[activeIndex()].focus({ preventScroll: true });
+    }
+
+    function settle(value = state.index, { focus = false, instant = false } = {}) {
+      stopTween();
+      target = limit(Math.round(value));
+      if (!gsap || reduced.matches || instant || Math.abs(target - state.index) < .001) {
+        state.index = target;
+        finish(focus);
+        return;
+      }
+      tween = gsap.to(state, {
+        index: target,
+        duration: .32 + Math.min(.28, Math.abs(target - state.index) * .07),
+        ease: 'power3.out',
+        overwrite: true,
+        onUpdate: render,
+        onComplete: () => finish(focus),
+      });
+    }
+
+    function releaseCapture() {
+      const previous = gesture;
+      gesture = null;
+      track.classList.remove('is-dragging');
+      if (previous && track.hasPointerCapture(previous.id)) track.releasePointerCapture(previous.id);
+      return previous;
+    }
+
+    function reset() {
+      if (sleeping) return;
+      if (gesture?.dragging) suppressClickUntil = performance.now() + 400;
+      releaseCapture();
+      settle(state.index, { instant: true });
+    }
+
+    function clearPlateMotion(item) {
+      item.style.removeProperty('--side');
+      item.style.removeProperty('--spread');
+      item.style.removeProperty('--retreat');
+      item.style.removeProperty('--scale');
+      item.style.opacity = '';
+      item.style.visibility = '';
+      item.style.zIndex = '';
+      item.style.transform = '';
+      item.classList.remove('is-focus', 'is-hover', 'is-feature', 'is-page', 'is-entering');
+    }
+
+    function sleep() {
+      if (sleeping) return;
+      sleeping = true;
+      stopTween();
+      releaseCapture();
+      hoverIndex = -1;
+      track.classList.remove('coverflow', 'is-dragging');
+      track.removeAttribute('data-input');
+      items.forEach(clearPlateMotion);
+    }
+
+    function wake() {
+      if (!sleeping && track.classList.contains('coverflow')) {
+        settle(state.index, { instant: true });
+        return;
+      }
+      sleeping = false;
+      track.classList.add('coverflow');
+      setInputMode(modeFrom());
+      items.forEach(clearPlateMotion);
+      settle(state.index, { instant: true });
+    }
+
+    function select(item, instant = false) {
+      const i = items.indexOf(item);
+      if (i < 0) return;
+      releaseCapture();
+      settle(state.index + offsetOf(i), { instant, focus: true });
+    }
+
+    track.addEventListener('pointerdown', event => {
+      if (!enabled() || !event.isPrimary || event.button !== 0 || gesture) return;
+      setInputMode(modeFrom(event.pointerType));
+      hoverIndex = -1;
+      stopTween();
+      target = state.index;
+      suppressClickUntil = 0;
+      gesture = {
+        id: event.pointerId, x: event.clientX, y: event.clientY,
+        start: state.index, unit: unit(), lastX: event.clientX,
+        time: event.timeStamp, velocity: 0, dragging: false,
+      };
     });
-    clone.addEventListener('click', () => openViewer(origin));
-    clone.addEventListener('focus', () => {
-      if (board.dataset.filter !== 'all' || !viewer.hidden) return;
-      snapTrack(clone.closest('.row-track'), clone);
+
+    track.addEventListener('pointermove', event => {
+      if (!gesture || gesture.id !== event.pointerId) {
+        if (!gesture && event.pointerType !== 'touch') {
+          const item = event.target.closest('.plate');
+          const next = item ? items.indexOf(item) : -1;
+          if (next !== hoverIndex) {
+            hoverIndex = next;
+            render();
+          }
+        }
+        return;
+      }
+      const dx = event.clientX - gesture.x;
+      const dy = event.clientY - gesture.y;
+      if (!gesture.dragging) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) < 7) return;
+        if (Math.abs(dy) > Math.abs(dx)) {
+          releaseCapture();
+          settle();
+          return; // Keep vertical touch panning native.
+        }
+        gesture.dragging = true;
+        track.setPointerCapture(event.pointerId);
+        track.classList.add('is-dragging');
+        track.focus({ preventScroll: true });
+      }
+      event.preventDefault();
+      const elapsed = Math.max(8, event.timeStamp - gesture.time);
+      const velocity = (gesture.lastX - event.clientX) / gesture.unit / elapsed;
+      gesture.velocity = elapsed > 90 ? velocity : .35 * gesture.velocity + .65 * velocity;
+      gesture.lastX = event.clientX;
+      gesture.time = event.timeStamp;
+      state.index = limit(gesture.start - dx / gesture.unit);
+      target = state.index;
+      render();
+    });
+
+    function endPointer(event, cancelled = false) {
+      if (!gesture || gesture.id !== event.pointerId) return;
+      const previous = releaseCapture();
+      if (previous.dragging) suppressClickUntil = performance.now() + 400;
+      const velocity = !cancelled && event.timeStamp - previous.time < 90 ? previous.velocity : 0;
+      const travel = reduced.matches ? 0 : Math.max(-3, Math.min(3, velocity * 180));
+      settle(state.index + travel, { focus: previous.dragging });
+    }
+    track.addEventListener('pointerup', event => endPointer(event));
+    track.addEventListener('pointercancel', event => endPointer(event, true));
+    track.addEventListener('lostpointercapture', event => endPointer(event, true));
+    track.addEventListener('pointerleave', event => {
+      if (gesture && !gesture.dragging) endPointer(event, true);
+      if (hoverIndex !== -1) {
+        hoverIndex = -1;
+        render();
+      }
+    });
+    track.addEventListener('dragstart', event => event.preventDefault());
+
+    track.addEventListener('wheel', event => {
+      if (!enabled() || gesture || event.ctrlKey || event.metaKey) return;
+      const horizontal = Math.abs(event.deltaX) > Math.abs(event.deltaY);
+      // Vertical page scrolling stays available until the user focuses a deck.
+      if (!horizontal && !event.shiftKey && !focused()) return;
+      const delta = horizontal ? event.deltaX : event.deltaY;
+      if (!delta) return;
+      if (!loop && ((state.index <= 0 && delta < 0) || (state.index >= count - 1 && delta > 0))) return;
+      event.preventDefault();
+      stopTween();
+      const scale = event.deltaMode === 1 ? unit() * .35 : event.deltaMode === 2 ? unit() : 1;
+      state.index = limit(state.index + Math.max(-2, Math.min(2, delta * scale / unit())));
+      target = state.index;
+      // Keep focus on the deck while its former centered button moves away.
+      if (focused()) track.focus({ preventScroll: true });
+      render();
+      wheelTimer = setTimeout(() => settle(state.index, { focus: true }), 140);
+    }, { passive: false });
+
+    track.addEventListener('keydown', event => {
+      if (!enabled() || event.altKey || event.ctrlKey || event.metaKey) return;
+      let next;
+      if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+        const direction = event.key === 'ArrowRight' ? 1 : -1;
+        const pending = Math.sign(target - state.index);
+        const base = pending && pending !== direction ? state.index : target;
+        next = Math.round(base) + direction;
+      }
+      else if (event.key === 'Home') next = state.index + offsetOf(0);
+      else if (event.key === 'End') next = state.index + offsetOf(count - 1);
+      else if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        if (!event.repeat) openViewer(items[activeIndex()]);
+        return;
+      } else return;
+      event.preventDefault();
+      releaseCapture();
+      track.focus({ preventScroll: true });
+      // Bound queued key-repeat travel, while retaining immediate reversals.
+      if (event.key.startsWith('Arrow')) next = Math.max(state.index - 3, Math.min(state.index + 3, next));
+      settle(next, { focus: true });
+    });
+
+    track.addEventListener('click', event => {
+      if (!enabled()) return;
+      event.preventDefault();
+      if (event.detail && performance.now() < suppressClickUntil) return;
+      const item = event.target.closest('.plate');
+      track.focus({ preventScroll: true });
+      if (!item) return;
+      const i = items.indexOf(item);
+      if (i === activeIndex() && Math.abs(state.index - Math.round(state.index)) < .001) openViewer(item);
+      else select(item);
+    });
+    finish(false);
+    return { reset, select, sleep, wake, contains: item => items.includes(item) };
+  }
+
+
+function setupStillsLayouts(track, deck) {
+  const row = track.closest('.studio-row');
+  const board = document.querySelector('.studio-board');
+  const items = [...track.querySelectorAll('.plate')];
+  const switcher = document.querySelector('.still-layouts');
+  const buttons = [...document.querySelectorAll('.still-layout')];
+  const gsap = window.gsap;
+  let mode = 'magazine';
+  let featured = items[0];
+  let page = 0;
+  let rail = null;
+  let stage = null;
+  let turning = false;
+  let bookGesture = null;
+
+  function layoutName() {
+    return board.dataset.filter === 'still' ? (board.dataset.stillLayout || 'magazine') : '';
+  }
+
+  function clearBookChrome() {
+    if (stage) {
+      items.forEach(item => track.append(item));
+      stage.remove();
+      stage = null;
+    }
+    rail?.remove();
+    rail = null;
+    items.forEach(item => {
+      item.classList.remove('is-page', 'is-entering', 'is-feature');
+      item.style.clipPath = '';
+      item.style.webkitClipPath = '';
+      gsap?.set(item, { clearProps: 'transform,transformOrigin,clipPath,opacity,x,y,scale,scaleX,scaleY' });
     });
   }
 
-  function currentOrigin(track) {
-    const plate = nearestPlate(track);
-    const value = plate && plate.dataset.origin;
-    return value === undefined ? 0 : Number(value);
+  function applyMagazine(instant = true) {
+    clearBookChrome();
+    board.dataset.stillLayout = 'magazine';
+    if (!featured || !items.includes(featured)) featured = items[0];
+    items.forEach(item => {
+      item.classList.toggle('is-feature', item === featured);
+      item.tabIndex = 0;
+    });
+    track.setAttribute('aria-roledescription', 'gallery');
+    track.setAttribute('aria-description', 'A magazine grid. Activate a still to bring it forward. Activate the large still to open it.');
   }
 
-  function wrapTrack(track) {
-    const span = Number(track.dataset.span) || setSpan(track);
-    const copies = Number(track.dataset.copies) || 0;
-    if (span <= 0 || copies < 3) return false;
-    const plate = nearestPlate(track);
-    if (!plate) return false;
-    let copy = Number(plate.dataset.copy);
-    if (Number.isNaN(copy)) return false;
-    const mid = Math.floor(copies / 2);
-    let x = track.scrollLeft;
-    let shifted = false;
-    while (copy < mid) {
-      x += span;
-      copy += 1;
-      shifted = true;
-    }
-    while (copy > mid) {
-      x -= span;
-      copy -= 1;
-      shifted = true;
-    }
-    if (shifted && Math.abs(x - track.scrollLeft) >= 1) {
-      wrapping = true;
-      if (gsap) gsap.killTweensOf(track);
-      track.scrollLeft = x;
-      wrapping = false;
-      snapping = false;
-      return true;
-    }
-    return false;
-  }
-
-  function buildLoop(track, keepIndex = 0) {
-    const originals = originalsOf(track);
-    if (!originals.length) return;
-    track.style.paddingLeft = '0px';
-    track.style.paddingRight = '0px';
-
-    const reuse = track.dataset.looped === 'true'
-      && Number(track.dataset.viewport) === track.clientWidth
-      && Number(track.dataset.span) > 0;
-    if (reuse) {
-      wrapTrack(track);
+  function flipTo(next, instant = false) {
+    if (!next || !items.includes(next)) return;
+    if (next === featured) {
+      openViewer(next);
       return;
     }
-
-    destroyLoop(track);
-    originals.forEach((plate, i) => {
-      plate.dataset.origin = String(i);
+    const first = new Map(items.map(item => [item, item.getBoundingClientRect()]));
+    featured = next;
+    items.forEach(item => item.classList.toggle('is-feature', item === featured));
+    if (instant || !gsap || reduced.matches) return;
+    items.forEach(item => {
+      const a = first.get(item);
+      const b = item.getBoundingClientRect();
+      const sx = a.width / Math.max(1, b.width);
+      const sy = a.height / Math.max(1, b.height);
+      gsap.fromTo(item, {
+        x: a.left - b.left,
+        y: a.top - b.top,
+        scaleX: sx,
+        scaleY: sy,
+        transformOrigin: '0 0',
+      }, {
+        x: 0, y: 0, scaleX: 1, scaleY: 1,
+        duration: .72,
+        ease: 'power3.inOut',
+        overwrite: true,
+        onComplete: () => { gsap.set(item, { clearProps: 'transform,transformOrigin' }); },
+      });
     });
+  }
 
-    const first = originals[0];
-    const last = originals[originals.length - 1];
-    const gap = parseFloat(getComputedStyle(track).gap) || 0;
-    const span = (last.offsetLeft + last.offsetWidth) - first.offsetLeft + gap;
-    let copies = 3;
-    if (span > 0) {
-      copies = Math.max(3, Math.ceil((track.clientWidth + 2 * span) / span));
-      if (copies % 2 === 0) copies += 1;
-    }
-    const midCopy = Math.floor(copies / 2);
-    const before = document.createDocumentFragment();
-    const after = document.createDocumentFragment();
-    for (let copy = 0; copy < copies; copy++) {
-      if (copy === midCopy) continue;
-      for (const plate of originals) {
-        const clone = plate.cloneNode(true);
-        clone.dataset.clone = 'true';
-        clone.dataset.origin = plate.dataset.origin;
-        clone.dataset.copy = String(copy);
-        clone.tabIndex = -1;
-        clone.setAttribute('aria-hidden', 'true');
-        clone.classList.remove('is-focus');
-        bindClone(clone, plate);
-        (copy < midCopy ? before : after).append(clone);
+  function buildBook() {
+    if (stage) return;
+    stage = document.createElement('div');
+    stage.className = 'book-stage';
+    rail = document.createElement('div');
+    rail.className = 'book-rail';
+    rail.setAttribute('role', 'tablist');
+    rail.setAttribute('aria-label', 'Stills in this book');
+    items.forEach((item, i) => {
+      stage.append(item);
+      const thumb = document.createElement('button');
+      thumb.type = 'button';
+      thumb.className = 'book-thumb';
+      thumb.dataset.index = String(i);
+      thumb.setAttribute('role', 'tab');
+      thumb.setAttribute('aria-label', item.getAttribute('aria-label') || `Still ${i + 1}`);
+      const src = item.querySelector('img');
+      if (src) {
+        const img = document.createElement('img');
+        img.src = src.currentSrc || src.src;
+        img.alt = '';
+        thumb.append(img);
       }
-    }
-    originals.forEach(plate => {
-      plate.dataset.copy = String(midCopy);
+      thumb.addEventListener('click', () => turnTo(i));
+      rail.append(thumb);
     });
-    track.prepend(before);
-    track.append(after);
-    track.dataset.copies = String(copies);
-    track.dataset.span = String(span);
-    track.dataset.viewport = String(track.clientWidth);
-    track.dataset.looped = 'true';
-
-    const index = Math.max(0, Math.min(originals.length - 1, keepIndex));
-    const target = track.querySelector(`.plate[data-copy="${midCopy}"][data-origin="${index}"]`) || originals[index];
-    if (target) track.scrollLeft = targetScroll(track, target);
-    wrapTrack(track);
+    track.append(stage, rail);
   }
 
-  function paintTrack(track) {
-    const mid = track.getBoundingClientRect().left + track.clientWidth / 2;
-    for (const plate of track.querySelectorAll('.plate')) {
-      if (!motionOk()) {
-        plate.style.setProperty('--rail-o', '1');
-        plate.style.setProperty('--rail-blur', '0px');
-        plate.style.setProperty('--rail-scale', '1');
-        plate.classList.add('is-focus');
-        continue;
-      }
-      const box = plate.getBoundingClientRect();
-      const dist = Math.abs(box.left + box.width / 2 - mid);
-      const t = Math.min(1, dist / Math.max(box.width * 0.9, 1));
-      const e = t * t * (3 - 2 * t);
-      plate.style.setProperty('--rail-o', String(1 - e * 0.62));
-      plate.style.setProperty('--rail-blur', `${(e * 8).toFixed(2)}px`);
-      plate.style.setProperty('--rail-scale', String(1 - e * 0.08));
-      plate.classList.toggle('is-focus', t < 0.35);
-    }
+  function syncThumbs() {
+    if (!rail) return;
+    [...rail.children].forEach((thumb, i) => {
+      const on = i === page;
+      thumb.classList.toggle('is-on', on);
+      thumb.setAttribute('aria-selected', on ? 'true' : 'false');
+      thumb.tabIndex = on ? 0 : -1;
+    });
   }
 
-  function targetScroll(track, plate) {
-    const trackBox = track.getBoundingClientRect();
-    const plateBox = plate.getBoundingClientRect();
-    const delta = (plateBox.left + plateBox.width / 2) - (trackBox.left + track.clientWidth / 2);
-    return track.scrollLeft + delta;
-  }
-
-  function nearestPlate(track) {
-    const mid = track.getBoundingClientRect().left + track.clientWidth / 2;
-    let best = null;
-    let bestDist = Infinity;
-    for (const plate of track.querySelectorAll('.plate')) {
-      const box = plate.getBoundingClientRect();
-      const d = Math.abs(box.left + box.width / 2 - mid);
-      if (d < bestDist) {
-        bestDist = d;
-        best = plate;
-      }
-    }
-    return best;
-  }
-
-  function snapTrack(track, plate, duration) {
-    wrapTrack(track);
-    const target = plate || nearestPlate(track);
-    if (!target) return;
-    const x = targetScroll(track, target);
-    const time = duration ?? (motionOk() ? 0.55 : 0);
-    if (Math.abs(x - track.scrollLeft) < 1) {
-      paintTrack(track);
+  function turnTo(index, instant = false, fromClick = false) {
+    const count = items.length;
+    const next = ((index % count) + count) % count;
+    if (next === page && !instant && fromClick) {
+      openViewer(items[page]);
       return;
     }
-    if (!gsap || time === 0) {
-      track.scrollLeft = x;
-      wrapTrack(track);
-      paintTrack(track);
+    if (next === page && !instant) return;
+    const prev = page;
+    const prevPlate = items[prev];
+    const nextPlate = items[next];
+    page = next;
+    featured = nextPlate;
+    syncThumbs();
+    if (instant || !gsap || reduced.matches || prev === next) {
+      items.forEach(item => {
+        item.classList.toggle('is-page', item === nextPlate);
+        item.classList.remove('is-entering');
+        item.style.clipPath = '';
+        gsap?.set(item, { clearProps: 'transform,clipPath' });
+      });
       return;
     }
-    snapping = true;
-    gsap.to(track, {
-      scrollLeft: x,
-      duration: time,
-      ease: 'power3.out',
-      overwrite: true,
-      onUpdate: () => paintTrack(track),
+    if (turning) gsap.killTweensOf(items);
+    turning = true;
+    const forward = (next - prev + count) % count <= count / 2;
+    const hidden = forward ? 'inset(0 100% 0 0)' : 'inset(0 0 0 100%)';
+    items.forEach(item => item.classList.remove('is-entering'));
+    prevPlate.classList.add('is-page');
+    nextPlate.classList.add('is-entering');
+    gsap.set(nextPlate, { clipPath: hidden, x: forward ? 28 : -28 });
+    gsap.timeline({
+      defaults: { ease: 'power3.inOut' },
       onComplete: () => {
-        snapping = false;
-        wrapTrack(track);
-        paintTrack(track);
+        items.forEach(item => {
+          item.classList.toggle('is-page', item === nextPlate);
+          item.classList.remove('is-entering');
+        });
+        gsap.set(nextPlate, { clearProps: 'transform,clipPath' });
+        turning = false;
       },
+    })
+      .to(nextPlate, { clipPath: 'inset(0 0% 0 0%)', x: 0, duration: .72 }, 0)
+      .to(prevPlate, { x: forward ? -18 : 18, duration: .72 }, 0);
+  }
+
+  function applyBook(instant = true) {
+    board.dataset.stillLayout = 'book';
+    buildBook();
+    page = Math.max(0, items.indexOf(featured));
+    if (page < 0) page = 0;
+    featured = items[page];
+    turnTo(page, true);
+    track.setAttribute('aria-roledescription', 'photobook');
+    track.setAttribute('aria-description', 'A photobook. Use arrows, swipe, or the thumbnails to turn pages. Activate the open page to view it.');
+    track.tabIndex = 0;
+  }
+
+  function releaseBookGesture() {
+    const previous = bookGesture;
+    bookGesture = null;
+    if (previous && stage?.hasPointerCapture(previous.id)) stage.releasePointerCapture(previous.id);
+    return previous;
+  }
+
+  function onBookPointerDown(event) {
+    if (layoutName() !== 'book' || !event.isPrimary || event.button !== 0 || bookGesture) return;
+    bookGesture = { id: event.pointerId, x: event.clientX, y: event.clientY, dragging: false };
+  }
+  function onBookPointerMove(event) {
+    if (!bookGesture || bookGesture.id !== event.pointerId) return;
+    const dx = event.clientX - bookGesture.x;
+    const dy = event.clientY - bookGesture.y;
+    if (!bookGesture.dragging) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) < 8) return;
+      if (Math.abs(dy) > Math.abs(dx)) { releaseBookGesture(); return; }
+      bookGesture.dragging = true;
+      stage.setPointerCapture(event.pointerId);
+    }
+    event.preventDefault();
+  }
+  function onBookPointerUp(event) {
+    if (!bookGesture || bookGesture.id !== event.pointerId) return;
+    const previous = releaseBookGesture();
+    const dx = event.clientX - previous.x;
+    if (!previous.dragging || Math.abs(dx) < 36) return;
+    turnTo(page + (dx < 0 ? 1 : -1));
+  }
+
+  track.addEventListener('click', event => {
+    if (board.dataset.filter !== 'still') return;
+    const item = event.target.closest('.plate');
+    if (!item || !items.includes(item)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (mode === 'magazine') flipTo(item);
+    else if (mode === 'book') turnTo(items.indexOf(item), false, true);
+  });
+  track.addEventListener('keydown', event => {
+    if (board.dataset.filter !== 'still' || event.altKey || event.ctrlKey || event.metaKey) return;
+    if (mode !== 'book') return;
+    if (event.key === 'ArrowRight') { event.preventDefault(); turnTo(page + 1); }
+    else if (event.key === 'ArrowLeft') { event.preventDefault(); turnTo(page - 1); }
+    else if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openViewer(items[page]); }
+  });
+
+  // Book gestures live on the stage once it exists; bind on the track as well
+  // so a newly created stage still receives bubbled pointer events.
+  track.addEventListener('pointerdown', event => {
+    if (event.target.closest('.book-stage, .book-stage *') || event.target.classList.contains('book-stage') || event.target.closest('.plate') && mode === 'book') {
+      onBookPointerDown(event);
+    }
+  });
+  track.addEventListener('pointermove', onBookPointerMove);
+  track.addEventListener('pointerup', onBookPointerUp);
+  track.addEventListener('pointercancel', event => {
+    if (bookGesture && bookGesture.id === event.pointerId) releaseBookGesture();
+  });
+
+  for (const button of buttons) {
+    button.addEventListener('click', () => {
+      const next = button.dataset.stillLayout;
+      if (next === mode) return;
+      mode = next;
+      for (const item of buttons) {
+        const on = item.dataset.stillLayout === mode;
+        item.classList.toggle('is-on', on);
+        item.setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
+      sync(true);
     });
   }
 
-  function clearRails() {
-    for (const track of tracks) {
-      if (gsap) gsap.killTweensOf(track);
-      destroyLoop(track);
-      track.style.paddingLeft = '';
-      track.style.paddingRight = '';
-      for (const plate of track.querySelectorAll('.plate')) {
-        plate.style.removeProperty('--rail-o');
-        plate.style.removeProperty('--rail-blur');
-        plate.style.removeProperty('--rail-scale');
-        plate.classList.remove('is-focus');
-      }
-    }
-    snapping = false;
-  }
-
-  function syncRails(animate = false) {
-    if (board.dataset.filter !== 'all') {
-      clearRails();
+  function sync(fromSwitch = false) {
+    const active = board.dataset.filter === 'still';
+    switcher.hidden = !active;
+    if (!active) {
+      clearBookChrome();
+      board.removeAttribute('data-still-layout');
+      items.forEach(item => item.classList.remove('is-feature', 'is-page', 'is-entering'));
+      deck?.wake();
       return;
     }
-    for (const track of activeTracks()) {
-      buildLoop(track, currentOrigin(track));
-      paintTrack(track);
-      if (animate) snapTrack(track, nearestPlate(track), motionOk() ? 0.45 : 0);
+    deck?.sleep();
+    board.dataset.stillLayout = mode;
+    if (mode === 'book') applyBook(!fromSwitch);
+    else applyMagazine(!fromSwitch);
+    requestAnimationFrame(() => refresh());
+  }
+
+  function reveal(plate, instant = true) {
+    if (!items.includes(plate)) return;
+    featured = plate;
+    page = items.indexOf(plate);
+    if (mode === 'book') turnTo(page, instant);
+    else {
+      items.forEach(item => item.classList.toggle('is-feature', item === featured));
     }
   }
 
-  const hasScrollEnd = 'onscrollend' in window;
-  function scheduleSnap(track) {
-    clearTimeout(settleTimers.get(track));
-    settleTimers.set(track, setTimeout(() => {
-      if (!snapping && board.dataset.filter === 'all') snapTrack(track);
-    }, 160));
-  }
+  return { sync, reveal };
+}
+
+  const decks = tracks.filter(track => track.closest('.studio-row').dataset.row !== 'ai').map(createDeck);
+  const resetDecks = () => decks.forEach(deck => deck.reset());
+  const stillsTrack = document.querySelector('.studio-row[data-row="still"] .row-track');
+  const stillsDeck = decks.find(deck => deck.contains(stillsTrack.querySelector('.plate')));
+  const stillsLayouts = setupStillsLayouts(stillsTrack, stillsDeck);
+  reduced.addEventListener('change', resetDecks);
+  addEventListener('resize', resetDecks);
+  addEventListener('blur', resetDecks);
+  document.addEventListener('viewchange', resetDecks);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) resetDecks(); });
 
   function setFilter(kind) {
+    resetDecks();
     for (const filter of filters) {
       const on = filter.dataset.filter === kind;
       filter.classList.toggle('is-on', on);
@@ -535,32 +1048,43 @@ function setupStudio() {
       row.hidden = kind === 'all' ? row.dataset.row === 'ai' : row.dataset.row !== kind;
     }
     board.dataset.filter = kind;
+    stillsLayouts.sync();
     requestAnimationFrame(() => {
-      syncRails(false);
       refresh();
     });
   }
 
   function openViewer(from) {
+    resetDecks();
     const items = visible();
     index = Math.max(0, items.indexOf(from));
     const plate = items[index];
     if (!plate) return;
     showPlate(plate);
+    syncAudio(plate);
     viewer.hidden = false;
     viewer.removeAttribute('inert');
     document.body.classList.add('viewer-open');
+    document.querySelector('#studio').inert = true;
+    dock.inert = false;
     document.querySelector('.viewer-close').focus();
     followTransition();
   }
   function closeViewer() {
     if (viewer.hidden) return;
+    stopAudio();
     const items = visible();
     const source = items[index];
     viewer.hidden = true;
     viewer.setAttribute('inert', '');
     document.body.classList.remove('viewer-open');
-    if (source) source.focus();
+    document.querySelector('#studio').inert = document.body.dataset.view !== 'studio';
+    dock.inert = false;
+    if (source) {
+      if (board.dataset.filter === 'still') stillsLayouts.reveal(source, true);
+      else decks.find(deck => deck.contains(source))?.select(source, true);
+      source.focus({ preventScroll: true });
+    }
     followTransition();
   }
   function step(delta) {
@@ -568,22 +1092,14 @@ function setupStudio() {
     if (!items.length) return;
     index = (index + delta + items.length) % items.length;
     showPlate(items[index]);
+    syncAudio(items[index]);
   }
 
   for (const filter of filters) filter.addEventListener('click', () => setFilter(filter.dataset.filter));
-  for (const plate of plates) {
-    plate.addEventListener('pointermove', event => {
-      const box = plate.getBoundingClientRect();
-      plate.style.setProperty('--mx', `${((event.clientX - box.left) / box.width) * 100}%`);
-      plate.style.setProperty('--my', `${((event.clientY - box.top) / box.height) * 100}%`);
-    });
+  for (const plate of plates.filter(plate => plate.dataset.kind === 'ai')) {
     plate.addEventListener('click', () => openViewer(plate));
-    plate.addEventListener('focus', () => {
-      if (board.dataset.filter !== 'all' || !viewer.hidden) return;
-      const track = plate.closest('.row-track');
-      if (track) snapTrack(track, plate);
-    });
   }
+  document.addEventListener('viewchange', () => { if (!viewer.hidden) closeViewer(); });
   document.querySelector('.viewer-close').addEventListener('click', closeViewer);
   document.querySelector('.viewer-prev').addEventListener('click', () => step(-1));
   document.querySelector('.viewer-next').addEventListener('click', () => step(1));
@@ -592,28 +1108,15 @@ function setupStudio() {
     if (document.body.dataset.view !== 'studio') return;
     if (event.key === 'Escape') closeViewer();
     if (viewer.hidden) return;
+    if (event.target.closest?.('.viewer-volume-slider, .viewer-progress-slider')) return;
+    if (event.key === ' ' || event.code === 'Space') { event.preventDefault(); toggleAudio(); }
     if (event.key === 'ArrowRight') { event.preventDefault(); step(1); }
     if (event.key === 'ArrowLeft') { event.preventDefault(); step(-1); }
   });
 
-  for (const track of tracks) {
-    track.addEventListener('scroll', () => {
-      if (board.dataset.filter !== 'all' || wrapping) return;
-      wrapTrack(track);
-      paintTrack(track);
-      if (!hasScrollEnd && !snapping) scheduleSnap(track);
-    }, { passive: true });
-    track.addEventListener('scrollend', () => {
-      if (wrapping || snapping || board.dataset.filter !== 'all') return;
-      wrapTrack(track);
-      snapTrack(track);
-    });
-  }
-  for (const img of board.querySelectorAll('img')) {
-    if (!img.complete) img.addEventListener('load', () => syncRails(false), { once: true });
-  }
-  addEventListener('resize', () => syncRails(false));
-  syncRails(false);
 }
 setupStudio();
 watchTabInk();
+
+await Promise.all(lenses.map(lens => lens.ready));
+document.documentElement.dataset.glassReady = 'true';

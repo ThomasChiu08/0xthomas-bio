@@ -71,33 +71,37 @@
       <button type="button" class="filter" data-filter="film" aria-pressed="false">Film</button>
       <button type="button" class="filter" data-filter="ai" aria-pressed="false">AI</button>
     </div>
+    <div class="still-layouts" hidden role="group" aria-label="Stills layout">
+      <button type="button" class="still-layout is-on" data-still-layout="magazine" aria-pressed="true">Magazine</button>
+      <button type="button" class="still-layout" data-still-layout="book" aria-pressed="false">Book</button>
+    </div>
   </header>
   <div class="studio-board" data-filter="all">
     <div class="studio-row" data-row="still" aria-label="Stills">
       <p class="row-label">Stills</p>
       <div class="row-track">
-        <button type="button" class="plate plate-a ratio-1-1 has-media" data-kind="still" data-label="Still" aria-label="Hands holding a camera">
+        <button type="button" class="plate plate-a ratio-1-1 has-media" data-kind="still" data-label="Still" data-audio="assets/studio/audio/preview.m4a" aria-label="Hands holding a camera">
           <img src="assets/studio/still-2521-1x1.jpg" alt="Hands holding a silver and black rangefinder camera" width="1280" height="1280">
         </button>
-        <button type="button" class="plate plate-b ratio-1-1 has-media" data-kind="still" data-label="Still" aria-label="A crowded city crossing">
+        <button type="button" class="plate plate-b ratio-1-1 has-media" data-kind="still" data-label="Still" data-audio="assets/studio/audio/preview.m4a" aria-label="A crowded city crossing">
           <img src="assets/studio/still-3969-1x1.jpg" alt="A crowded city crossing beneath billboards and a glass corner building" width="1280" height="1280">
         </button>
-        <button type="button" class="plate plate-c ratio-1-1 has-media" data-kind="still" data-label="Still" aria-label="A night street with camera-store neon">
+        <button type="button" class="plate plate-c ratio-1-1 has-media" data-kind="still" data-label="Still" data-audio="assets/studio/audio/preview.m4a" aria-label="A night street with camera-store neon">
           <img src="assets/studio/still-3977-1x1.jpg" alt="A night street lined with camera-store neon signs" width="1280" height="1280">
         </button>
-        <button type="button" class="plate plate-d ratio-1-1 has-media" data-kind="still" data-label="Still" aria-label="A narrow alley with lanterns and autumn leaves">
+        <button type="button" class="plate plate-d ratio-1-1 has-media" data-kind="still" data-label="Still" data-audio="assets/studio/audio/preview.m4a" aria-label="A narrow alley with lanterns and autumn leaves">
           <img src="assets/studio/still-3974-1x1.jpg" alt="A narrow alley with red lanterns and autumn leaves" width="1280" height="1280">
         </button>
-        <button type="button" class="plate plate-e ratio-1-1 has-media" data-kind="still" data-label="Still" aria-label="A cyclist passing a mural under an overpass">
+        <button type="button" class="plate plate-e ratio-1-1 has-media" data-kind="still" data-label="Still" data-audio="assets/studio/audio/preview.m4a" aria-label="A cyclist passing a mural under an overpass">
           <img src="assets/studio/still-3972-1x1.jpg" alt="A cyclist passing a mural under an overpass" width="1280" height="1280">
         </button>
-        <button type="button" class="plate plate-f ratio-1-1 has-media" data-kind="still" data-label="Still" aria-label="A stone path leading to a small pine island">
+        <button type="button" class="plate plate-f ratio-1-1 has-media" data-kind="still" data-label="Still" data-audio="assets/studio/audio/preview.m4a" aria-label="A stone path leading to a small pine island">
           <img src="assets/studio/still-causeway-1x1.jpg" alt="A stone path over water leading to a small pine-covered island under a blue sky" width="1280" height="1280">
         </button>
-        <button type="button" class="plate plate-g ratio-1-1 has-media" data-kind="still" data-label="Still" aria-label="A cyclist crossing under a red neon arch at night">
+        <button type="button" class="plate plate-g ratio-1-1 has-media" data-kind="still" data-label="Still" data-audio="assets/studio/audio/preview.m4a" aria-label="A cyclist crossing under a red neon arch at night">
           <img src="assets/studio/still-3970-1x1.jpg" alt="A cyclist crossing under a red neon arch at night" width="1280" height="1280">
         </button>
-        <button type="button" class="plate plate-h ratio-1-1 has-media" data-kind="still" data-label="Still" aria-label="Tokyo Tower seen between buildings at dusk">
+        <button type="button" class="plate plate-h ratio-1-1 has-media" data-kind="still" data-label="Still" data-audio="assets/studio/audio/preview.m4a" aria-label="Tokyo Tower seen between buildings at dusk">
           <img src="assets/studio/still-3734-1x1.jpg" alt="Tokyo Tower seen between buildings at dusk" width="1280" height="1280">
         </button>
       </div>
@@ -137,7 +141,20 @@
     <p class="viewer-kind"></p>
     <img class="viewer-image" alt="" hidden>
     <p class="viewer-copy">Coming soon.</p>
+    <div class="viewer-audio" hidden>
+      <button type="button" class="viewer-audio-toggle" aria-label="Pause music">Pause</button>
+      <div class="viewer-progress">
+        <span class="viewer-time viewer-time-now">0:00</span>
+        <input type="range" class="viewer-progress-slider" min="0" max="0" step="0.01" value="0" aria-label="Seek">
+        <span class="viewer-time viewer-time-end">0:00</span>
+      </div>
+      <label class="viewer-volume">
+        <span class="sr-only">Volume</span>
+        <input type="range" class="viewer-volume-slider" min="0" max="1" step="0.01" value="0.7" aria-label="Volume">
+      </label>
+    </div>
   </div>
+  <audio class="viewer-player" preload="metadata"></audio>
   <button type="button" class="viewer-nav viewer-next" aria-label="Next work">Next</button>
 </div>
 
